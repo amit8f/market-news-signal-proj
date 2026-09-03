@@ -1,0 +1,110 @@
+========================================================================
+PHASE 4 - MODEL REPORT v3 [4-class (Strong Sell merged into Sell)] depth-capped, trailing sigma, frozen labels
+========================================================================
+events with features: 22692 | features: 37 | unlabeled dropped: 1
+relevance tiers (modeling set): t1=18596, t2=4096
+
+-- FROZEN label thresholds --
+  quantiles (0.1, 0.35, 0.65, 0.9) fit on train pool ONLY -> score edges: [-1.4308, -0.3714, 0.3465, 1.48]
+  Sell         [-inf, -1.650%)
+  Neutral      [-1.650%, -0.428%)
+  Buy          [-0.428%, +0.400%)
+  Strong Buy   [+0.400%, +1.707%)
+  class shares  train vs holdout:
+    Sell         35.0% vs 24.7%
+    Neutral      30.0% vs 38.7%
+    Buy          25.0% vs 28.5%
+    Strong Buy   10.0% vs 8.2%
+
+holdout: >= 2026-08-03 (n=3197) | embargo 1d | sigma strictly trailing per event
+cv: 3 expanding folds inside train pool only | optuna trials: 40
+
+-- best hyperparameters --
+  n_estimators: 757
+  max_depth: 5
+  learning_rate: 0.13180596870342223
+  subsample: 0.625171612272567
+  colsample_bytree: 0.9260741278503519
+  min_child_weight: 10.528054744235208
+  reg_alpha: 1.261359391194559e-07
+  reg_lambda: 2.8686226449745202
+  cv macro-F1 at best: 0.3031
+
+-- holdout results --
+model                     acc  macroF1  ordMAE
+champion xgb            0.370    0.357   0.920
+baseline: all Neutral   0.387    0.139   0.695
+baseline: freq-random   0.272    0.238   1.060
+baseline: sentiment rule  0.354    0.246   0.826
+
+-- champion per-class (holdout) --
+            precision  recall     f1  support
+class                                        
+Sell            0.283   0.446  0.346      789
+Neutral         0.498   0.315  0.386     1236
+Buy             0.368   0.420  0.392      910
+Strong Buy      0.448   0.229  0.303      262
+
+-- confusion matrix (rows=actual, cols=predicted) --
+predicted    0    1    2   3
+actual                      
+0          352  151  265  21
+1          466  389  347  34
+2          276  233  382  19
+3          151    8   43  60
+  >> Strong-Sell direction error: 21/789 (2.7%) predicted Buy/Strong Buy
+
+-- weekly stability (retrained each week, fixed params) --
+week_start  n_test  train_n  accuracy  macro_f1
+2026-07-20    1268    16681     0.402     0.349
+2026-07-27    1471    17959     0.336     0.299
+2026-08-03    1604    19425     0.330     0.337
+2026-08-10    1105    21039     0.510     0.414
+2026-08-17     488    22195     0.383     0.311
+
+-- calibration by predicted-confidence decile --
+       n  mean_conf  empirical_acc
+bin                               
+0    320      0.392          0.303
+1    320      0.464          0.331
+2    319      0.515          0.357
+3    320      0.566          0.344
+4    320      0.621          0.347
+5    319      0.679          0.389
+6    320      0.737          0.403
+7    319      0.802          0.423
+8    320      0.872          0.419
+9    320      0.948          0.384
+
+-- feature importance --
+macd_hist_1h                 0.30894
+dist_from_vwap_pct           0.28511
+bb_pctb_1h                   0.27637
+bb_width_1h                  0.26923
+atr14_1h_pct                 0.25509
+rsi_14_1h                    0.23404
+vol_ratio_5d_40d             0.20452
+pub_hour_et                  0.20251
+dist_sma50_pct               0.19381
+mom_5d                       0.18509
+rv_short_5d                  0.17690
+sector_mean_mom5d            0.16529
+dist_sma200_pct              0.16266
+sector_rel_mom5d             0.15336
+headlines_prior_24h          0.15280
+hours_since_prev_headline    0.08034
+p_neu                        0.06558
+p_neg                        0.06240
+sect_Technology              0.05941
+sect_Financials              0.05907
+
+-- leakage guards active --
+  * sigma_2h strictly trailing per event (windows completed before publish)
+  * label edges fit once on train pool, frozen for holdout/live
+  * purged walk-forward CV with embargo; no shuffle anywhere
+  * hourly indicators last COMPLETED bar; regime uses prior-day closes
+  * relevance filter applied before event construction
+-- residual caveats --
+  * IEX-only tape; FinBERT entity noise reduced but not eliminated
+  * class balance guaranteed on train pool only; holdout may drift
+========================================================================

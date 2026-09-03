@@ -1,0 +1,136 @@
+# Project Brief: Real-Time News-Driven Stock Signal & Alert System (XGBoost) — v2
+
+## Context and Goal
+This is a personal research project. Build a pipeline that watches official financial news in near real time, scores its likely impact per stock over the next 2 hours using XGBoost, and sends an alert only when the signal is actionable. The immediate goal is to find out — through rigorous backtesting and a live shadow-mode period — whether this approach produces a genuine edge, not to assume it will and skip straight to trusting it.
+
+This is a research and educational tool, not financial advice. Predicting short-term market reactions to public news is a hard, heavily studied problem. Treat every model output, backtest, and alert as something to be evaluated, not as a finished trading system.
+
+## Non-Negotiable Constraints
+- **Data budget:** free-tier APIs only, for now
+- **Universe:** S&P 500 + Nasdaq-100 (~600 US equities) as the starting point — must be config-driven, not hardcoded, so it can be resized or swapped for a custom ticker list or screener output later
+- **Horizon:** every signal targets the next 2 hours of price action
+- **News scope:** official financial news only (company press releases, earnings, M&A, SEC filings, macro releases) — no social media or forum sentiment
+- **Output per signal:** a 5-class ordinal call — Strong Sell / Sell / Neutral / Buy / Strong Buy — plus an entry price, a 2-hour target price, and a stop-loss
+- **Alerting:** push a notification only when the signal is non-neutral; stay silent on Neutral
+
+## Data Leakage Is the #1 Failure Mode — Read This First
+This is the single most common reason a backtest looks brilliant and then fails live, so it governs every phase below, not just feature engineering:
+- Every feature (technical, sentiment, regime) may only use information available strictly *before* the prediction timestamp. Lag/shift rolling calculations explicitly — don't trust that a library "just handles it."
+- News/sentiment features must reflect the article as first published, never a later correction or update to that same story.
+- Cross-validation and train/test splits must be strictly time-ordered (walk-forward). Random shuffling of time series data is the most common way leakage sneaks in, including *inside* hyperparameter search, not just the final split.
+- If a backtest shows suspiciously high accuracy (e.g., 70–80%+ on a 5-class problem), treat that as a signal to re-audit for leakage first, not as a result to celebrate.
+
+## Recommended Free Data Sources — Maximizing Historical Depth
+(Researched and current as of August 2026 — free-tier terms shift often; re-verify at build time and substitute the closest equivalent if something has changed.)
+
+**Primary news — Finnhub (finnhub.io):**
+- Free tier: ~60 REST calls/minute, no credit card, personal/non-commercial use
+- Real-time US quotes via `/quote`; company news with real-time updates and ~1 year of history via `/company-news` — your live feed and core training corpus
+- Also free here: general market news, SEC filings, basic company fundamentals/profile (useful for sector tagging)
+- Caveat: WebSocket streaming is capped at 50 symbols on the free plan — don't stream live prices for all ~600 tickers at once (see architecture note below)
+
+**Extending news history — SEC EDGAR full-text search (completely free, no key, no signup):**
+- Covers every filing back to **2001** — roughly 25 years — searchable by keyword/phrase, form type, and date; fair-use limit is 10 requests/second
+- Filings themselves *are* the official record for the biggest structural events (M&A, guidance changes, restatements, 8-Ks generally) — use this to deepen historical coverage of high-conviction events well beyond Finnhub's 1-year window
+
+**Extending price history — Alpaca Markets Data API (free "Basic" plan):**
+- ~5 years of historical minute-level bars via the free IEX feed — this is what actually lets you compute an accurate 2-hour-forward return for a news event from 2–3 years ago, which free intraday data (e.g., `yfinance`) generally can't reach
+- Caveat: IEX represents a small slice of total US equity volume, so free bars can be noisier/wider-spread than the full consolidated tape — acceptable for this project, just don't treat the prices as perfectly precise
+
+**Optional deep-history supplement — GDELT Project (free, no key):**
+- Global news updated every 15 minutes since 2015 (coarser before that), with built-in tone/sentiment scoring via its Global Knowledge Graph
+- Not natively ticker-tagged — using it means doing your own entity resolution (matching company mentions to your ticker list), which is real extra work. Treat as an optional way to add both historical depth and daily volume once the core pipeline is working, not a day-one requirement.
+
+**Your dataset also grows on its own:** every signal Phase 6/7 logs — fired or not — becomes a new labeled example. Historical depth compounds over time; it isn't capped at whatever you start with.
+
+**Deliberately ruled out:**
+- *Alpha Vantage News & Sentiment* — good pre-scored sentiment, but 25 requests/day on the free tier can't support continuous polling at this scale
+- *NewsAPI.org free tier* — articles delayed ~24h, which defeats a 2-hour reaction window
+- *yfinance* for live polling — increasingly rate-limited/blocked; fine only for a one-off bulk historical pull, not the live backbone
+
+## The Key Architecture Decision: News-Triggered, Not Price-Streamed
+Don't continuously stream or poll prices for all ~600 tickers — free tiers can't support that, and it isn't necessary:
+1. Poll news endpoints every 1–2 minutes (cheap — a handful of calls, not one per ticker)
+2. When a fresh item is tagged to a ticker, make one on-demand quote call for that ticker to capture the entry price
+3. Schedule a follow-up check ~2 hours later on that same ticker to log the actual outcome
+
+This keeps steady-state API usage roughly proportional to news volume, not ticker count, and comfortably fits Finnhub's free rate limit.
+
+## Build Order
+
+### Phase 1 — Historical dataset construction
+- Pull ~1 year of company news per ticker from Finnhub; extend high-conviction event coverage back to 2001 via SEC EDGAR full-text search
+- Pull matching historical minute-level bars (Alpaca, ~5 years free) and compute the actual forward return over the following 2 hours per event, correctly aligning after-hours/overnight news to the next trading session
+- Document in the README exactly how much genuine historical news-with-timestamp data was obtained — don't let a small or biased sample quietly become "the training set"
+
+### Phase 2 — Feature engineering
+- Sector/industry tag per ticker (Finnhub company profile, or a static GICS-style mapping)
+- Text features: entity/ticker extraction, a finance-tuned sentiment score via **`ProsusAI/finbert`** (Hugging Face `transformers`, runs locally, free), news type (earnings/M&A/macro/analyst/regulatory), recency
+- Technical features: RSI, MACD, Bollinger Bands, ATR, VWAP via `pandas-ta` or `ta` — standard, well-tested libraries, no need to hand-roll these
+- **Regime/context features** (this is the ELO-equivalent from the video — giving the model a baseline sense of "what kind of market is this" before it reacts to a headline): rolling realized-volatility regime (high/low-vol state), broad market trend state (e.g., SPY relative to its 50/200-day moving average), sector-relative strength, proximity to the next earnings date
+- Strict rule: every feature uses only information available at the exact moment the news was published — never a later correction to that story
+
+### Phase 3 — Labeling
+- Forward 2-hour return per event, normalized by that ticker's own typical volatility (so "big" is relative to the stock, not a fixed %)
+- Convert to the 5-class label using data-driven, volatility-based quantile thresholds — document the exact thresholds chosen
+- Entry = price at news time. Stop-loss = derived from ATR (e.g., 1× ATR against the position) rather than learned directly — more robust on a modest dataset
+- Note: the 5 classes are ordinal (Strong Sell < Sell < Neutral < Buy < Strong Buy) — plain multiclass is a fine start, but revisit if class boundaries look arbitrary once you have real results
+
+### Phase 4 — Model, Tuned Properly
+- **What "XGBoost" actually is:** not one tree — a sequential ensemble that typically builds hundreds of shallow trees, where each new tree is trained on the residual errors of every tree before it. The number of trees (`n_estimators`) is a hyperparameter to search for, not a number to guess.
+- One multiclass classifier for the 5-way signal (`multi:softprob`, so you get class probabilities, not just a hard label, to help judge "Buy" vs "Strong Buy" boundaries)
+- One regressor for the 2-hour target price. Consider XGBoost's native quantile objective (`reg:quantileerror`, available in recent XGBoost versions with `tree_method="hist"`) trained on multiple quantiles at once (e.g., alpha = [0.1, 0.5, 0.9]) to get a predicted *range* rather than a single point estimate — a more honest signal of uncertainty, and useful for sizing the stop-loss/target
+- **Hyperparameter tuning is mandatory, not optional:** use Optuna (preferred) or `RandomizedSearchCV`/`GridSearchCV` as a fallback, tuning at minimum `n_estimators`, `max_depth`, `learning_rate`, `subsample`, `colsample_bytree`, `min_child_weight`, and `reg_alpha`/`reg_lambda`
+- Cross-validation must use `TimeSeriesSplit` / walk-forward folds — never plain k-fold, which would leak future information into hyperparameter selection itself (a second, easy-to-miss place leakage hides beyond just the final train/test split)
+- Report SHAP values for feature importance — this tells you how much weight news/sentiment features actually carry versus pure technical/regime features, which is genuinely useful for judging whether the "news" half of the project is adding real signal
+- Expect heavy class imbalance (most news is "Neutral") — use class weights and report precision/recall per class, not just overall accuracy; a false "Strong Buy" costs far more than a missed one
+
+### Phase 5 — Backtest and honesty check
+- Simulate what following each historical signal's entry/target/stop-loss would actually have returned
+- Compare against two baselines: a random signal generator, and a naive "buy on positive-sounding headlines" rule. If the tuned model doesn't clearly beat both, say so plainly
+- Report per-class precision/recall, probability calibration, and simulated P&L accounting for spread/slippage, not just mid-price fills
+
+### Phase 6 — Live pipeline
+- Scheduler polls news every 1–2 minutes during market hours
+- New relevant item → feature pipeline → model inference → if non-neutral, fetch entry price, compute target/stop-loss, log it, send a Telegram alert
+- Log every signal — fired or not — to a local SQLite database
+
+### Phase 7 — Shadow mode before it informs any real decision
+- Run Phase 6 for several weeks across varied market conditions, logging signals without acting on them
+- Only if shadow-mode results hold up against the Phase 5 baselines should this start to inform real decisions — and even then, treat it as one input alongside position sizing and a hard max-loss rule, never autopilot
+
+### Phase 8 — Ongoing Retraining ("Self-Adjusting")
+This is what "self-fix and adjust" should actually mean for a tree ensemble — not per-event online learning (XGBoost can technically warm-start from an existing booster, but this is fragile and not the robust choice here), but scheduled, evaluated retraining:
+- On a fixed cadence (e.g., weekly, or after N new logged examples), rebuild the training set from history plus everything logged since the last retrain
+- Re-run the full Optuna hyperparameter search on the expanded dataset
+- Backtest the new candidate ("challenger") on the same held-out evaluation window and baselines as the currently deployed model ("champion")
+- Only promote the challenger if it matches or beats the champion on the agreed metrics — never auto-promote just because it's newer
+- Keep every model version and its evaluation metrics logged, so you can tell whether retraining is actually helping over time or just adding noise
+
+## Hosting
+(Researched, current as of August 2026.)
+
+**Recommended — Oracle Cloud "Always Free" tier:** a genuinely permanent (not trial) free ARM VM, generous enough (multi-core, tens of GB RAM in the current allocation) to run the scheduler, feature pipeline, and inference continuously. Run the polling loop as a systemd service or cron job so it survives reboots. Watch for: sign-up occasionally rejected on the first try (retry, or try a different region); fully idle instances can be reclaimed, but genuine periodic activity (which this project has anyway) should be safe.
+
+**Simpler fallback — GitHub Actions scheduled workflow:** free scheduled-run minutes in your own repo, zero server management. Trade-off: no guaranteed minute-level timing precision (can be delayed under load) — good for prototyping, less ideal as the permanent home.
+
+**Avoid:** Railway, Fly.io, and Render's free web-service tier are now trial-credit or sleep-on-inactivity based, which fights a "must run continuously" requirement.
+
+## Alerting
+- Telegram bot (via @BotFather, free) — instant push to your phone, no SMS cost
+- Alert only on Buy / Strong Buy / Sell / Strong Sell; suppress Neutral
+- Each alert includes: ticker, signal, entry/target/stop-loss, model confidence, and a link to the source — not a full reproduction of the article
+
+## Deliverables Expected
+1. Modular codebase — separate components for data ingestion, feature engineering, labeling/backtesting, model training + tuning, live inference, alerting, and retraining, not one monolithic script
+2. A config file (YAML/JSON) for adjustable parameters (ticker universe, polling interval, class thresholds) — API keys from environment variables, never hardcoded
+3. A README covering: which free API keys are needed and how to get them, how to run the historical backtest, how to deploy (Oracle Cloud or fallback), and how shadow mode and retraining work
+4. A results log (SQLite or JSON lines) so performance can be reviewed as more live data accumulates
+5. A SHAP-based feature importance report and the Optuna tuning history, so you can see what the model is actually relying on
+6. Clear documentation that this is an experimental research tool, a summary of its backtested/shadow-mode performance to date, and that none of it guarantees future returns
+
+## Suggested First Milestone
+Before building everything, prove out Phases 1–2 end-to-end on a small slice — 20–30 tickers, a few months of news — and show the resulting labeled dataset and features. Getting this right early avoids rebuilding the pipeline later once it's running across the full ~600-ticker universe.
+
+## If Something Doesn't Match
+Free-tier terms and hosting offers change. If a recommended source is no longer available or behaves differently than described, substitute the closest free equivalent, note the substitution and why in the README, and keep going rather than blocking on it.

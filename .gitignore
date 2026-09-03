@@ -1,0 +1,23 @@
+.env
+__pycache__/
+*.pyc
+data/raw/
+data/interim/
+data/processed/
+data/live/
+models/
+*.log
+*.db
+.venv/
+venv/
+.claude/
+~/
+
+# VM-pulled journal dumps - not source, may carry logged secrets (see
+# FINNHUB_API_KEY leak in poll_failures.error / journal text, found in the
+# 2026-09-03 pre-git audit); *.db above already covers the stray db pulls
+/vm_pull_*.txt
+
+# project bundles - redundant snapshots of this same source tree
+*.tar.gz
+*.tgz

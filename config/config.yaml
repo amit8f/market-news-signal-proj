@@ -1,0 +1,152 @@
+project: news-signal-milestone
+
+universe:
+  - ticker: AAPL
+    sector: Technology
+  - ticker: MSFT
+    sector: Technology
+  - ticker: NVDA
+    sector: Technology
+  - ticker: GOOGL
+    sector: Technology
+  - ticker: META
+    sector: Technology
+  - ticker: AMD
+    sector: Technology
+  - ticker: AVGO
+    sector: Technology
+  - ticker: ORCL
+    sector: Technology
+  - ticker: CRM
+    sector: Technology
+  - ticker: INTC
+    sector: Technology
+  - ticker: JPM
+    sector: Financials
+  - ticker: BAC
+    sector: Financials
+  - ticker: GS
+    sector: Financials
+  - ticker: MS
+    sector: Financials
+  - ticker: WFC
+    sector: Financials
+  - ticker: JNJ
+    sector: Healthcare
+  - ticker: UNH
+    sector: Healthcare
+  - ticker: PFE
+    sector: Healthcare
+  - ticker: LLY
+    sector: Healthcare
+  - ticker: ABBV
+    sector: Healthcare
+  - ticker: AMZN
+    sector: Consumer
+  - ticker: WMT
+    sector: Consumer
+  - ticker: PG
+    sector: Consumer
+  - ticker: HD
+    sector: Consumer
+  - ticker: COST
+    sector: Consumer
+  - ticker: MCD
+    sector: Consumer
+  - ticker: NKE
+    sector: Consumer
+  - ticker: XOM
+    sector: Energy
+  - ticker: CVX
+    sector: Energy
+  - ticker: COP
+    sector: Energy
+  - ticker: BA
+    sector: Industrials
+  - ticker: CAT
+    sector: Industrials
+  - ticker: HON
+    sector: Industrials
+  - ticker: GE
+    sector: Industrials
+  - ticker: LMT
+    sector: Industrials
+  - ticker: DIS
+    sector: Communication
+  - ticker: NFLX
+    sector: Communication
+  - ticker: T
+    sector: Communication
+  - ticker: CMCSA
+    sector: Communication
+  - ticker: TSLA
+    sector: Consumer
+
+benchmark: SPY
+
+dates:
+  news_start: "2026-04-15"
+  news_end: "2026-08-22"
+  bars_start: "2026-04-15"
+  bars_end: "2026-08-21"
+  daily_lookback_days: 400
+
+ingestion:
+  finnhub_rate_limit_per_min: 55
+  alpaca_page_limit: 10000
+  alpaca_feed: iex
+  min_bars_around_event: 5
+
+features:
+  rsi_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bb_period: 20
+  bb_std: 2.0
+  atr_period: 14
+  vol_regime_short_days: 5
+  vol_regime_long_days: 60
+  sma_fast: 50
+  sma_slow: 200
+
+labels:
+  horizon_minutes: 120
+  entry_max_delay_minutes: 15
+  quantiles: [0.10, 0.35, 0.65, 0.90]
+
+model:
+  holdout_start: "2026-08-03"
+  embargo_days: 1
+  cv_folds: 3
+  initial_train_days: 30
+  n_optuna_trials: 40
+  seed: 42
+  max_depth_min: 3
+  max_depth_max: 6
+
+calibration:
+  precision_floor_by_class:
+    Sell: 0.55
+    Buy: 0.50
+    Strong Buy: 0.45
+  min_fire_rate: 0.01
+  max_fire_rate: 0.05
+
+backtest:
+  slippage_bps_per_side: 3
+  stop_atr_multiple: 1.0
+
+live:
+  shadow: true
+  notify_enabled: false
+  poll_interval_sec: 120
+  news_lookback_minutes: 10
+  bar_cache_days: 75
+  # Provisional starting value, set 2026-09-01 with no empirical basis yet - retrieval_lag
+  # table logs every item's lag so this can be recalibrated once real data exists.
+  max_retrieval_lag_minutes: 60
+  # Time-bucket width (per ticker) used to tag same-ticker signals from either news source
+  # with a shared dedup_group_id, for correlating likely-duplicate stories after the fact.
+  # Both sources are still scored independently - nothing is suppressed based on this.
+  dedup_window_minutes: 15

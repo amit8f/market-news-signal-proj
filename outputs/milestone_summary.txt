@@ -1,0 +1,59 @@
+========================================================================
+MILESTONE SLICE - EVENTS DATASET SUMMARY (labels frozen at train split)
+========================================================================
+universe: 24 tickers | news window: 2026-04-15 .. 2026-08-22
+horizon: 120 trading minutes | entry max delay: 15 min
+
+-- pipeline funnel --
+deduped news items:                 58416
+relevance tiers (1=primary, 2=secondary, 3=passing): {3: 34048, 1: 20036, 2: 4332}
+after relevance filter:             24263
+dropped (insufficient hourly warmup): 1570
+final events with features:         22693
+overnight-aligned to next open:     6300
+
+-- relevance tier distribution in final dataset --
+  tier 1 (primary subject  )  18597  (82.0%)
+  tier 2 (secondary mention)   4096  (18.0%)
+  tier 3 (passing          )      0  (0.0%)
+
+-- per-ticker median trailing sigma (2h) --
+  AMD    sigma=2.9429%  (valid trailing sigma for 1722 events)
+  CAT    sigma=1.7732%  (valid trailing sigma for 512 events)
+  TSLA   sigma=1.6037%  (valid trailing sigma for 2040 events)
+  META   sigma=1.5255%  (valid trailing sigma for 1693 events)
+  BA     sigma=1.4681%  (valid trailing sigma for 847 events)
+  HON    sigma=1.3651%  (valid trailing sigma for 383 events)
+  NFLX   sigma=1.3291%  (valid trailing sigma for 919 events)
+  NVDA   sigma=1.2429%  (valid trailing sigma for 1104 events)
+  GS     sigma=1.2300%  (valid trailing sigma for 895 events)
+  UNH    sigma=1.2038%  (valid trailing sigma for 491 events)
+  MSFT   sigma=1.1593%  (valid trailing sigma for 1491 events)
+  GOOGL  sigma=1.1459%  (valid trailing sigma for 1103 events)
+  XOM    sigma=1.0874%  (valid trailing sigma for 422 events)
+  AMZN   sigma=1.0596%  (valid trailing sigma for 1588 events)
+  CVX    sigma=1.0551%  (valid trailing sigma for 677 events)
+  WMT    sigma=0.9965%  (valid trailing sigma for 980 events)
+  HD     sigma=0.9667%  (valid trailing sigma for 400 events)
+  DIS    sigma=0.9542%  (valid trailing sigma for 302 events)
+  PG     sigma=0.9352%  (valid trailing sigma for 278 events)
+  AAPL   sigma=0.9303%  (valid trailing sigma for 1997 events)
+  JNJ    sigma=0.8854%  (valid trailing sigma for 487 events)
+  PFE    sigma=0.7669%  (valid trailing sigma for 557 events)
+  BAC    sigma=0.7485%  (valid trailing sigma for 756 events)
+  JPM    sigma=0.7316%  (valid trailing sigma for 1048 events)
+  events without trailing sigma (excluded from labeling): 1
+
+-- features present --
+  36 columns: atr14_1h_pct, bb_pctb_1h, bb_width_1h, delay_sec, dist_from_vwap_pct, dist_sma200_pct, dist_sma50_pct, entry_price, exit_price, fwd_ret_2h, headlines_prior_24h, hours_since_prev_headline, macd_hist_1h, mom_5d, news_type, p_neg, p_neu, p_pos, pub_hour_et, published_date, relevance_tier, rsi_14_1h, rv_short_5d, sect_Communication, sect_Consumer, sect_Energy, sect_Financials, sect_Healthcare, sect_Industrials, sect_Technology, sector_mean_mom5d, sector_rel_mom5d, sent_score, sigma_2h, spy_above_sma200, vol_ratio_5d_40d
+
+-- leakage guards applied --
+  * entry strictly at/after publish; exit exactly 120 trading min later
+  * hourly indicators taken from last COMPLETED hour bar only
+  * daily regime uses strictly prior-day closes
+  * sigma_2h is STRICTLY TRAILING per event (windows completed before publish)
+  * class quantile thresholds are NOT set here - fit once on train split in phase 4 and frozen
+  * sentiment from headline as published (no later corrections)
+  * relevance filter drops passing mentions before event construction
+  * walk-forward-safe by construction (no shuffle anywhere)
+========================================================================

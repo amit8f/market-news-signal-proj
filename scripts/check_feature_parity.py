@@ -42,7 +42,7 @@ def csv_minutes(ticker):
     m.index = pd.to_datetime(m.index, utc=True)
     return filter_regular_minutes(m, sessions)
 
-sample = df.groupby("ticker", group_keys=False).apply(lambda g: g.sample(min(1, len(g)), random_state=3))
+sample = df.sample(frac=1, random_state=3).drop_duplicates(subset="ticker", keep="first")
 print(f"parity check on {len(sample)} events (one per ticker), full cached bar history as input")
 worst = {}
 for _, ev in sample.iterrows():

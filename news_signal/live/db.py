@@ -96,10 +96,14 @@ def insert_signal(conn, **kw):
 
 
 def pending_outcomes(conn, older_than_iso):
+    """Every signal regardless of status (fired or silent) is eligible for outcome
+    backfill once it's old enough to have resolved - not just fired ones, so real
+    price-outcome evidence accumulates for the full decision distribution (including
+    suppressed/below-threshold classes), not only the subset that actually fired."""
     rows = conn.execute(
         """SELECT s.signal_id,s.ticker,s.entry_price,s.stop_price,s.ts_utc FROM signals s
            LEFT JOIN outcomes o ON o.signal_id = s.signal_id
-           WHERE o.signal_id IS NULL AND s.status='fired' AND s.ts_utc <= ?""",
+           WHERE o.signal_id IS NULL AND s.ts_utc <= ?""",
         (older_than_iso,),
     ).fetchall()
     return rows

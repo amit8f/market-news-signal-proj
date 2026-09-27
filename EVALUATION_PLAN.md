@@ -555,6 +555,481 @@ not reset the evaluation clock. Logged for the record as a brief operational
 restart (confirmed via `systemctl status` at restart time), same as any other
 service restart that isn't itself a change-freeze event.
 
+**Diagnostic instrumentation added, 2026-09-04 - drafted, not yet deployed, no
+clock reset:** investigating an unresolved live anomaly found in a VM-pulled
+copy of `signals.db`: 5 signals (all NVDA, `ts_utc` 17:30:00-18:08:00 UTC on
+2026-09-03, all strictly after the 17:40:36 UTC dual-source deploy above, so
+not pre-migration legacy rows) have `news_source`, `dedup_group_id`, and
+`n_symbols` all NULL, despite every other ticker in the same window being
+tagged correctly. (Originally found as 4 rows, `ts_utc` 17:45:15-18:08:00;
+re-checked and a 5th, `signal_id` 279 at `ts_utc` 17:30:00, was found sharing
+the same ticker, `status=silent`/`suppress_reason=sell_side_suppressed`, and
+lack of explanation - note `signal_id` 279 was still written to the database
+*after* `signal_id` 278 despite its earlier `ts_utc`, i.e. this is retrieval
+lag on an older headline arriving in a later poll cycle, not evidence this
+row predates the others in real time.) Ruled out, with evidence, over several
+rounds: legacy/
+pre-migration data (timestamps postdate the deploy); per-row variation within
+a single `process_items()` call (`news_source` is a call-level argument, not
+recomputed per row; `dedup_group_id` is a pure per-row hash of `ticker` +
+time-bucket with no dependency on prior iterations or cache; neither can be
+`None` under the code that computes them); a separate/older insert path
+(exactly one `INSERT INTO signals` exists anywhere in the repo or either
+deploy tarball, and both already include all three columns); a stale/older
+version actually running on the VM (refuted directly: `run_loop.py`/`db.py`
+pulled live off the VM diff byte-for-byte identical to the local working
+copies - zero differences); shared cache state across same-ticker items in
+one cycle (`BarCache.get()` is the only cross-iteration shared object in the
+loop, and it feeds `entry_price`/`stop_price`/feature-building only, never
+`news_source`/`dedup_group_id`/`n_symbols`); and an external writer (VM
+command history, Python history, cron, systemd timers, and other unit files
+all checked clean; no PID-overlap gap at either 2026-09-03 restart). **Root
+cause not yet found** - all mechanisms checked against the actual, confirmed-
+identical running code are structurally incapable of producing this, and no
+external cause was found either.
+
+Rather than continue guessing, added durable, per-call evidence capture so a
+recurrence is caught live instead of reconstructed after the fact: a new
+`signal_insert_log` table in `run_loop.py` (following the existing
+`poll_failures`/`stale_rejections`/`retrieval_lag` pattern - live-only
+diagnostic tables stay local to `run_loop.py`, not `db.py`'s canonical
+schema) and a new `_record_signal_insert()` call immediately before every
+call to `db.insert_signal()` in `process_items()`, persisting the exact
+kwargs dict (all 17 fields, including `news_source`/`dedup_group_id`/
+`n_symbols`) with its own `logged_at_utc` timestamp. This is diagnostic-only:
+it adds observability and changes nothing about which events are scored,
+what features/probabilities/calibration are computed, or how `decide()`
+thresholds fire - so per Section 7's scope ("model/threshold/config change"),
+this does not reset the evaluation clock even once deployed. Smoke-tested
+locally via `--inject-demo`: table created correctly, one row logged with the
+full expected field set (`news_source='finnhub'`,
+`dedup_group_id='2a8211527be0'`, `n_symbols=None`). **Not yet deployed** -
+per instruction, will ship bundled with whatever the next real change to
+`run_loop.py` ends up being, rather than as its own deploy.
+
+Re-checked for recurrence (2026-09-04): no signal after `signal_id` 279/the
+2026-09-03 17:30:00-18:08:00 window shows a NULL `news_source`. **The
+anomaly appears contained to that one Sept 3rd window - 5 affected signals
+total, not an ongoing issue** - though this is an observational check against
+`signals` itself, not yet the stronger, purpose-built evidence
+`signal_insert_log` will provide once deployed. Root cause remains unresolved
+regardless; this note only updates the count and confirms no further
+occurrences since.
+
+**Feature-parity check run for the first time, 2026-09-05 - no clock reset:**
+`scripts/check_feature_parity.py` (compares live `build_event_frame()` output
+against training-time features stored in `milestone_events.parquet`, per
+`CLAUDE.md`'s Commands section) had never actually been executed. Running it
+hit an immediate crash - `KeyError: 'ticker'` from
+`df.groupby("ticker", group_keys=False).apply(...)` - caused by a pandas 3.0
+behavior change (grouping column no longer passed into the applied callable
+by default; local venv runs pandas 3.0.5). Fixed with a one-line,
+behavior-equivalent replacement of the sampling logic
+(`df.sample(frac=1, random_state=3).drop_duplicates(subset="ticker",
+keep="first")` - same "one random row per ticker, seed=3" semantics). This is
+a local-only, read-only reporting script that never runs as part of the live
+service, so per `CLAUDE.md`'s explicit carve-out it does not qualify as a
+Section 7 change regardless of outcome - logged here for the record only.
+Result after the fix: 24 tickers checked, 0 with meaningful drift on every
+strict `FEATURE_COLS` feature (all `strict-max-rel-diff 0.00e+00`).
+
+**Known low-priority data-hygiene issue, 2026-09-05 - not fixed, not urgent:**
+the same parity run's `SOFT_COLS` output (`sector_mean_mom5d`,
+`sector_rel_mom5d` - printed for visibility, excluded from the script's
+pass/fail tally) shows real, non-zero drift between live and training-time
+values for several tickers, including sign flips (e.g. PFE, PG). Root cause:
+`peer_loader` in the live path reads the same local bar CSVs used for
+day-to-day trading, which have grown past the historical snapshot the
+training-time parquet was originally built from, so a 5-day sector-peer
+momentum window computed "live" today covers different calendar days than
+the one baked into the frozen training features. Both affected columns rank
+low in feature importance (`outputs/model_report.txt`: `sector_mean_mom5d`
+0.165, `sector_rel_mom5d` 0.153, well below the top technical block), and the
+strict-feature parity check above is otherwise clean, so this is logged as a
+known issue worth fixing eventually (e.g. by pinning `peer_loader` to a fixed
+historical window) rather than something requiring immediate action.
+
+**Recalibration planning sketch, 2026-09-08 - PLANNING ONLY, NOT AUTHORIZED,
+NO EXECUTION:** documented here for the record while the zero-Buy/Strong-Buy
+anomaly is still under investigation, per explicit instruction that this is a
+plan, not a change. As of 2026-09-08: 186 events since the last deploy, zero
+Buy/Strong Buy, vs. an ~8.73% expected rate from the training-period holdout
+(P~4x10^-8 under that rate). This spans two trading sessions separated by the
+Labor Day gap - confirmed via journal PID tracking that the service ran
+continuously as the same process (PID 106830, since the 2026-09-03T17:45:26
+restart) across that gap, so it is a fresh trading day but *not* a fresh
+process; some weight against a live in-memory-state theory is separately
+provided by the earlier 18/19 offline-recompute agreement, which reloads
+artifacts fresh with no live-process memory involved. Root cause (live bug vs.
+genuine regime shift) is not yet conclusively determined - this sketch exists
+so that if/when it is, the scope of what recalibration would require is
+already thought through rather than decided reactively.
+
+Scope decision to make first if this is pursued: recalibrate-only (refit
+isotonic calibration + thresholds via `run_phase5.py` against current-regime
+data, keep the existing champion model and frozen label-edge definitions) vs.
+full retrain (fresh label thresholds via `make_labels.py` + model refit via
+`run_phase4.py`). These are different-sized Section 7 events - recalibrate-
+only is the more surgical fix if the feature-outcome relationship is
+unchanged but the input feature *distribution* has shifted (consistent with
+the clean `check_feature_parity.py` result logged above: same pipeline,
+possibly different inputs); full retrain is the bigger undertaking, needed if
+the labels themselves (what forward-return quantile a given event lands in)
+would differ under current conditions.
+
+What recalibrate-only would require:
+1. Fresh calibration data with matured 120-min forward returns (`run_phase5.py`
+   is the only script permitted to write `calibration.pkl` /
+   `alert_thresholds.json` / `severity_regressor.json` - hand-editing or
+   partially replicating its logic is out of scope).
+2. Minimum sample size - the original fit used an embargoed holdout of
+   n=3197 across ~3 weeks (Strong Buy support alone was only 262). Shadow
+   mode has been running since 2026-09-01, ~1 week of real trading (~300
+   events total including today) - likely too small on its own for an
+   independently-collected fresh sample without also drawing on the
+   original offline dataset.
+3. Leakage-safe integration - if shadow-collected events are blended into
+   the training pool rather than treated as a separate fresh sample, the
+   purged walk-forward CV / embargo discipline (`news_signal/models/
+   splitting.py`) must be preserved exactly; shadow events, being
+   chronologically newest, would most naturally extend the holdout tail
+   rather than fold into train.
+4. Threshold re-selection - `alert_thresholds.json`'s precision-floor
+   threshold selection is fit together with calibration in `run_phase5.py`,
+   not independently adjustable after the fact.
+
+What full retrain would additionally require: re-running the full offline
+pipeline (`run_milestone.py` build stage -> `run_phase4.py` Optuna retune/
+retrain) on an extended dataset including the shift period, plus re-
+verifying `check_feature_parity.py` and the leakage guards still hold
+against the new data window.
+
+Section 7 consequences either way: this is explicitly a threshold/
+calibration/model change, not a bug fix - it would not qualify for the
+"affected days excluded" exception; it resets the evaluation clock outright,
+and the pre-registered promotion test would restart from zero at the new
+deploy timestamp. `live.notify_enabled` stays `false` throughout regardless
+of outcome, per Section 7b below. **No decision to recalibrate has been made;
+this entry is a planning reference only.**
+
+**Critical bug fix, logged per the Section 7 exception, 2026-09-09 - fixed,
+verified, and deployed:** root cause of the zero-Buy/Strong-Buy
+anomaly tracked down. `data/raw/calendar.csv` (the session start/end table
+`build_sessions()` uses) was generated once by `fetch_calendar()` against
+`config.yaml`'s frozen `dates.bars_end: "2026-08-21"`, and `run_loop.py`'s
+calendar setup only ever re-fetched it if the file was entirely missing
+(`if not calendar_path().exists()`), never for staleness - confirmed directly
+in source, not inferred. Because every live event since real signal
+collection began (2026-09-01) postdates that boundary,
+`session_vwap_before()`'s "inside session" check was `False` for every single
+live event, forcing `dist_from_vwap_pct` - the model's #2 most important
+feature (importance 0.285 per `outputs/model_report.txt`, second only to
+`macd_hist_1h` at 0.309) - to NaN on 100% of live decisions. Verified via the
+literal live code path (`build_technical_features()`, called identically by
+`build_event_frame()`): 459/459 live September events had this feature NaN.
+This differs sharply from training, where the feature is naturally NaN only
+~64% of the time (14518/22693 rows) - so XGBoost's fixed missing-value
+default-direction routing, learned from that mixed pattern, was being applied
+to every live decision instead of the roughly one-third of cases it was
+trained for.
+
+Fix (two parts, local-only so far): (1) `news_signal/ingest/alpaca_bars.py`'s
+`fetch_calendar()` now accepts optional `start`/`end` overrides, default
+unchanged, so existing offline callers (`run_milestone.py`, etc.) are
+unaffected and `config.yaml`'s frozen `dates.bars_start`/`bars_end` governing
+the offline research pipeline were NOT touched; (2) `run_loop.py` replaced the
+exists-only check with `_calendar_is_stale()`, which refetches whenever the
+calendar's last known date is within 14 days of today (pulling forward
+through today+60 days), so it self-corrects going forward instead of silently
+running out again.
+
+Verified: refreshed `calendar.csv` locally (now covers through 2026-11-06);
+confirmed `_calendar_is_stale()` correctly flags the old file as stale and the
+refreshed one as current. Replayed all 473 September shadow-mode events (fresh
+VM pull `signals_sept8_full.db`, 2026-09-01..09-08) through the real
+`build_event_frame()` -> `predict_proba` -> `calibrate` -> `decide()` path
+with the corrected calendar (453/473 scored; 20 skipped for relevance tier,
+unrelated to this fix):
+  - `dist_from_vwap_pct` now valid for 394/453 events (87%), vs. 0/453 before.
+  - Recorded (broken-calendar) class distribution: Sell 401 (88.5%),
+    Neutral 52 (11.5%), Buy 0, Strong Buy 0.
+  - Recomputed (fixed-calendar) class distribution: Sell 259 (57.2%),
+    Neutral 183 (40.4%), Buy 5 (1.1%), Strong Buy 6 (1.3%).
+  - 11/453 events (2.4%) flip from Sell/Neutral all the way to Buy/Strong Buy,
+    and all 11 flip `status` from `silent` to `fired` - 11 real alerts would
+    have fired live in this window under a working calendar, vs. zero
+    actually fired.
+
+This qualifies as the Section 7 exception: it restores intended feature
+computation for an already-trained, already-frozen model/calibration/
+threshold set - nothing in the model, calibration, thresholds, or the
+Section 5 decision rule was touched. Per the exception clause, results are
+NOT reset; **every day with scored signals from 2026-09-01 through the fix's
+VM deploy date is excluded as affected** (independent of Section 4a's
+mechanical gates) - given the bug applied to 100% of live decisions across
+that entire window, this covers essentially all shadow-mode data collected
+to date.
+
+**Deployed to the VM at 2026-09-09T13:07:29 UTC** (confirmed via `systemctl
+status` at restart time - new PID 147806, replacing the previous
+continuously-running PID 106830; journal shows a clean startup with no
+calendar-refresh log line, consistent with `_calendar_is_stale()` silently
+accepting the already-freshly-synced `calendar.csv` rather than needing to
+refetch). **Final excluded-day range under this exception: 2026-09-01 through
+2026-09-09T13:07:29 UTC** - all scored signals in that window are excluded
+from the day/signal counts as affected by this bug, independent of whatever
+Section 4a's mechanical gates would already exclude them for. Live
+confirmation that the fix is working on a real cycle (not just a clean
+restart): the 2026-09-09 post-deploy window (n=66, 2026-09-09T13:07:29 UTC
+through end of session) scored Sell 30.3% / Neutral 68.2% / Buy 1.5% / Strong
+Buy 0% - materially off the pre-fix 100% Sell/Neutral pattern, and included
+the project's first-ever fired signals (see milestone entry below).
+
+**Milestone, 2026-09-09 - factual record only, not a methodology change:**
+first-ever fired signals in this project's history, all three correctly
+staying log-only per `live.notify_enabled=false` (also that gate's first real
+exercise against a genuine fire, not just `--inject-demo`):
+  - `signal_id` 539, 2026-09-09T17:26:51 UTC, AAPL, Buy, p_cal=0.294,
+    "Apple Introduces 'Apple Reference Image' Standard..."
+  - `signal_id` 540, 2026-09-09T17:30:55 UTC, AAPL, Buy, p_cal=0.302,
+    "Apple Introduces iPhone Handoff..."
+  - `signal_id` 577, 2026-09-09T19:11:39 UTC, NVDA, Strong Buy, p_cal=0.372,
+    "Nvidia and Meta Are Hungry for HBM..." - also the first-ever Strong Buy.
+
+Residual note: even after the fix, the Buy/Strong Buy rate (2.4%) remains
+below the ~8.73% expected from the training-period holdout, and Neutral
+(40.4%) is elevated versus the training argmax baseline (25.43%) - so this
+bug appears to explain the large majority of the anomaly (Sell moved from a
+large over-representation to slightly *under* its 65.84% training baseline),
+but not necessarily all of it. The smaller `rsi_14_1h`/`bb_pctb_1h` shift
+noted in the entry above (calendar-independent features, unaffected by this
+fix) remains a candidate for whatever gap is left.
+
+**Investigated and refuted, 2026-09-10 - factual record only, no changes:**
+`signal_id` 577 and 649 (both NVDA, both Strong Buy) were flagged for sharing
+a bit-identical `prob_calibrated` (0.3722302768652679) despite different
+headlines, raised as two possible hypotheses: (1) a relevance-tagging bug
+misattributing an unrelated headline to NVDA, (2) a caching bug reusing a
+stale prediction across events. Both refuted with direct evidence. (1): the
+underlying Alpaca article behind `signal_id` 649 (headline about SolarEdge)
+was refetched from Alpaca's API directly and genuinely mentions NVIDIA in its
+summary ("a joint framework with NVIDIA") - a real tier-2 secondary mention,
+correctly passed through by `relevance_tier()`'s existing headline-then-
+summary text match, not a misattribution. (2): `prob_raw`, `severity_score`,
+`entry_price`, and `stop_price` all differ between the two rows, ruling out
+any full-row cache reuse; the shared `prob_calibrated` traces to the loaded
+`calibration.pkl` artifact directly - the Strong Buy isotonic calibration map
+has only 38 breakpoints and both events' distinct raw scores (0.9420197606086731
+and 0.9324530959129333) land in the same output plateau, confirmed by calling
+the map directly.
+
+Real finding worth keeping on record so it isn't re-investigated as a false
+alarm later: `prob_calibrated` values are frequently non-unique across
+signals - 75% of all 650 signals fired/scored since 2026-09-01 share an exact
+`prob_calibrated` value with at least one other row - because the calibration
+artifact's isotonic step-function resolution is coarse, especially for Strong
+Buy given its thin training sample (262 holdout examples). **This is expected
+behavior given the calibration artifact as fitted, not a defect.**
+
+Separately, noted as a minor observability gap (not fixed, not urgent): the
+`signals` table stores `headline` but never `summary`, which can make a
+legitimate tier-2 secondary relevance match look unexplained on casual
+review of the stored data alone, since the textual match that justified
+scoring the event is often only present in the summary.
+
+**Major finding, 2026-09-11 - factual record only, no live/config/model
+change:** the live `universe` (`config.yaml`, 40 tickers) and the offline
+training data (`data/processed/milestone_events.parquet`) do not match.
+Training data covers only **24 distinct tickers** - every one of them already
+in the live universe, so there is no unused low-risk expansion pool sitting
+in training data. The reverse gap is the real finding: **16 of the 40 live
+tickers have zero historical training coverage at all** - `ABBV`, `AVGO`,
+`CMCSA`, `COP`, `COST`, `CRM`, `GE`, `INTC`, `LLY`, `LMT`, `MCD`, `MS`, `NKE`,
+`ORCL`, `T`, `WFC`. This is not a hypothetical future risk: **160 of 650
+signals scored live to date (24.6%) are on these 16 tickers** (led by AVGO 34,
+ORCL 26, INTC 23, CRM 15), meaning roughly a quarter of all live decisions run
+through the frozen champion model + calibration with zero ticker-specific
+training exposure - the model is generalizing on shared cross-ticker features
+alone for this slice of live traffic. Likely cause: the live universe was
+expanded to 40 tickers after `milestone_events.parquet` was originally built,
+and the offline pipeline was never rerun to backfill the added names. No
+change made - this is a factual record of an existing gap, logged so it is
+tracked regardless of what (if anything) gets done about it. See the
+follow-up backfill entry below for a first offline-only look at whether the
+frozen model's behavior actually holds up on these 16 tickers.
+
+**Follow-up: offline backfill + model-tracking check for the 16 gap tickers,
+2026-09-12 - entirely offline, no live/config/model changes, no clock
+impact:** built a standalone historical dataset for the 16 tickers above,
+same pipeline and same historical window as the original build
+(2026-04-15..2026-08-21): 25,416 deduped headlines -> 11,059 labeled events
+after relevance filtering and warmup. News written to the existing (empty for
+these tickers) `data/raw/news/`; historical 1-min bars fetched into a new,
+SEPARATE `data/raw/bars_backfill16/` directory - the shared `data/raw/bars/`
+that live's `BarCache` owns was never read from or written to. Output is a
+new, separate `data/processed/milestone_events_backfill16.parquet` -
+`milestone_events.parquet` itself was never touched.
+
+Scored this backfill with the frozen champion model + calibration +
+thresholds (no retraining) and compared against the real historical outcome,
+reconstructed via `make_labels.py`'s exact frozen-edge formula. Caught and
+fixed an error in this reconstruction before trusting it: the champion model
+merges "Strong Sell" into "Sell", so the correct Sell/Neutral boundary is
+`edges[1]`, not `edges[0]` - validated the corrected methodology by
+reproducing `model_report.txt`'s reported holdout accuracy (got 0.336 vs. the
+reported 0.370; the small gap is consistent with that report using
+pre-calibration argmax vs. this check's post-calibration argmax).
+
+Result: **the frozen model tracks real historical outcomes on the 16
+never-trained tickers about as well as on its own training tickers** -0.375
+accuracy on the 16-ticker backfill vs. 0.336 on the reproduced 24-ticker
+holdout (same model, same methodology). Per-ticker accuracy ranges 0.299
+(ABBV) to 0.454 (MCD), comfortably inside the week-to-week variation the
+model already shows on training tickers (`model_report.txt`'s weekly
+stability table: 0.330-0.510). One caveat: Strong Buy precision is lower on
+the backfill (0.297 vs. 0.900 on holdout), but support is thin on both sides
+(54 vs. 262 predicted-Strong-Buy events) - more likely small-sample noise on
+an already-rare class than a robust ticker-specific degradation.
+
+Technical-feature distributions (RSI, MACD, Bollinger, ATR, VWAP-distance,
+momentum, sentiment) are largely similar between the 16 and the original 24;
+the one real difference is moderately higher realized volatility in the 16
+(ATR ~20% higher, Bollinger band width ~16% wider), plausibly just
+composition rather than anything structural. No action taken - this is
+evidence-gathering only, explicitly not a decision to expand the live
+universe, which remains a separate, later call.
+
+**Outcome tracking expanded to silent signals, 2026-09-14 - genuine scope
+expansion, not a bug fix; clock-impact read below, decision deferred to
+user:** confirmed with direct evidence (code + real data from
+`signals_sept10.db`) that `db.pending_outcomes()` only ever selected
+`status='fired'` signals for outcome backfill - silent signals (Neutral,
+suppressed Sell, below-threshold Buy) never got a real price outcome
+computed, by construction, since shadow mode began. Since Sell is
+unconditionally suppressed, this meant Sell's true performance had never
+been tracked with real outcome data at all.
+
+Fix: removed the `s.status='fired'` filter from `pending_outcomes()`'s SQL
+(`news_signal/live/db.py`) so every signal, regardless of status, becomes
+eligible for outcome backfill once old enough to have resolved.
+`backfill_outcomes()` (`run_loop.py`) required one additional change to
+support this: `stop_price` comes back from sqlite as `None` (not `NaN`) for
+every non-Buy/Strong-Buy signal, and the existing code called `float(stop_px)`
+unconditionally, which would raise on `None` - added an explicit
+`None`-to-`NaN` conversion before calling `simulate_exit()`. No change to
+`simulate_exit()` itself: it already treats a NaN stop as "never stops, exit
+at horizon close," exactly the right behavior for a signal that was never
+actually entered. No change to `decide()`, thresholds, calibration, or which
+events get scored - this only affects what happens to a signal's outcome
+tracking after a decision has already been made.
+
+Tested end-to-end against a disposable copy of real data
+(`signals_sept10.db`, 650 signals, 4 pre-existing outcomes, all fired): after
+running the patched `backfill_outcomes()`, outcomes went from 4 to 650 -
+**645 previously-untracked silent signals retroactively backfilled** (Sell
+485, Neutral 160, Buy 3, Strong Buy 2), confirming it reaches old-enough
+signals already sitting in the database, not just future ones. Zero silent
+outcomes show `stopped=True` (correct - no real stop level exists for a
+signal that never fired). The one previously-unbackfilled fired signal in
+the window was also correctly picked up, and existing fired-signal outcome
+values were unaffected (regression check). Sample outcome rows show sane,
+realistic entry/exit prices and gross/net returns throughout.
+
+**Deployed to the VM at 2026-09-14T19:40:37 UTC** (confirmed via `systemctl
+status` at restart time, new PID 191174; deploy confirmed clean). Per the
+informational-infrastructure treatment below, agreed by the user: **no clock
+reset, no excluded-day accounting needed** - this is logged as the confirmed
+deploy timestamp for the record only.
+
+My own read on clock impact, since asked: I'd treat this as informational/
+diagnostic infrastructure, not a Section-7-triggering change, and not
+because it fits the critical-bug-fix exception either (nothing was broken -
+this is scope that was apparently never built, as noted). The reasoning:
+Section 7 cares about changes that affect "results" - which events get
+scored, what class/probability they're assigned, whether they fire, and
+anything feeding the Section 5 promotion test's statistics. This change
+touches none of that; `decide()` and the entire scoring/firing path are
+byte-for-byte unchanged. Outcome rows are a purely retrospective record of
+what price did after an already-final decision, orthogonal to the promotion
+test's actual measurements - the same category of reasoning already applied
+to the `signal_insert_log` diagnostic-logging entry above (logged as
+diagnostic-only, no clock reset). **Decision confirmed by user: treated as
+informational/diagnostic infrastructure, no clock reset.**
+
+**Known data issue in the frozen model's training data, 2026-09-27 - logged only, no retrain, no
+clock reset:** discovered while reviewing an unrelated offline study that used Alpaca bars with
+`adjustment=all`. HON underwent a real 1-for-2 reverse split plus a same-day HONA spin-off on
+2026-06-29. The champion model's training pipeline (`news_signal/ingest/alpaca_bars.py`) fetches
+with `adjustment=split` (splits only, not spin-off value adjustments), so the spin-off's price
+drop appears in the cached bars as a raw ~51% single-day decline with no corresponding split
+adjustment to offset it - a real discontinuity, not a data-fetch error, but one the feature
+pipeline has no way to distinguish from a genuine 51% crash. Quantified against
+`data/processed/milestone_events.parquet`: HON accounts for 384 of 22,693 training rows; 105 of
+those have a non-NaN `vol_ratio_5d_40d` (the daily-regime features need >=62 trailing daily bars,
+so they only start populating in mid-July), and **all 105 sit inside the 60-day window following
+the discontinuity**, with median `vol_ratio_5d_40d` 0.148 versus 0.901 for all other tickers -
+i.e., every HON row with a populated volatility-ratio feature during this period is corrupted by
+the artifact, not a handful of edge cases. Of those, 31 fall inside the holdout (>=2026-08-03).
+Separately, 29 HON rows with `published_utc` in 2026-06-29..07-02 have hourly-indicator windows
+(`bb_width_1h`, etc.) spanning the discontinuous hourly bar directly: median `bb_width_1h` 1.881
+vs. 0.053 for HON overall - a ~35x distortion. `mom_5d`/`rv_short_5d` are unaffected for this
+window (both NaN for HON until mid-July, so they never see the bad data). This is a known,
+quantified defect in the FROZEN training artifacts (`champion_xgb_4class.json`,
+`calibration.pkl`) - fixing it would mean regenerating the offline dataset and re-running Phase
+4/5, a genuine model change requiring the full Section 7 process, not something to do
+reactively. No such change is made here. Live-side mitigation (preventing this from recurring via
+stale cached bars) is a separate, already-implemented fix - see the `BarCache` corporate-actions
+entry below.
+
+**`BarCache` corporate-actions fix, 2026-09-27 - Section 7 data-quality fix, implemented and
+tested locally, NOT deployed:** the live loop's `BarCache.get()` (`news_signal/live/run_loop.py`)
+only ever appends newly-fetched bars onto whatever CSV is already cached for a ticker; it never
+re-fetches historical data. If a split or spin-off occurs on a ticker whose cache already holds
+pre-event bars (exactly the HON situation above, live-side), the discontinuity would sit
+permanently in that ticker's cache file until manually deleted - a live-only latent risk distinct
+from the training-data issue already logged. This entry supersedes the first version of this fix
+(also dated 2026-09-27, same day): a same-day review found the first version handled spin-offs
+incorrectly and could re-delete an already-fixed cache; both are corrected below. No model,
+threshold, or config value changed; no clock reset - this only affects data hygiene for
+already-frozen live-side caches and a new suppression path for a rare event type.
+
+Fix, three parts:
+1. **Splits (`forward_split`/`reverse_split`):** unchanged from the first version - if a ticker's
+   cache already spans across a detected split's `ex_date`, the whole cached CSV is deleted so the
+   next `get()` call re-fetches it from scratch, consistently `adjustment=split`-adjusted, instead
+   of half raw/half adjusted.
+2. **Spin-offs (correction):** `adjustment=split` does not adjust for spin-off value changes at
+   all (confirmed on HON), so a re-fetch would still contain the fake price drop - deleting and
+   refetching does nothing useful here. Instead, a detected `spin_off` action now suppresses that
+   ticker's live decisions with `status='silent'`, `suppress_reason='corporate_action'` for
+   `CA_SUPPRESSION_TRADING_DAYS` (60) trading days from `ex_date` - long enough to cover the
+   longest affected feature window (`vol_ratio_5d_40d`). The signal is still fully logged
+   (`signal_insert_log`, `signals`) and its outcome still resolved as usual via `backfill_outcomes()`
+   (which already covers every status, not just fired) - only the decide()-driven fire/notify path
+   is overridden. These rows should be excluded from evaluation for that ticker over that window
+   (filter on `suppress_reason='corporate_action'` when computing fire rates, class distributions,
+   or hit rates) - a policy note for whoever runs `shadow_status.py`-style review, not a code
+   change to that read-only script.
+3. **Repeat-handling bug fix:** the first version re-checked every day within the lookback window
+   and would delete an already-correctly-refetched cache again, since a legitimately-adjusted
+   cache still spans across `ex_date` post-fix. Each `(ticker, ex_date, type)` is now recorded in
+   `data/raw/bars/corporate_actions_handled.json` once handled; a later check for an
+   already-recorded action is a no-op.
+4. **Lookback widened from 7 to 30 days** (`CA_LOOKBACK_DAYS`), so a VM outage of a few weeks can't
+   cause an action to age out of the check window before it's ever seen.
+
+Tested locally (`scripts/test_barcache_split_refetch.py`, three cases, all passing):
+- A cached ticker with pre-split-only bars, given a stubbed reverse-split action: cache is deleted
+  and refetched, resulting max single-day move 0.25% (previously would show a fake ~50%+ jump).
+- The same action re-checked on a fresh `BarCache` instance (simulating the next day's process):
+  the already-correctly-adjusted cache is left alone, not deleted again.
+- A stubbed spin-off action: suppression is confirmed active 5 trading days after `ex_date` and
+  lifted 61 trading days after; the action is recorded in the on-disk registry; no cache
+  deletion/refetch is attempted for the spin-off case.
+
+**Not yet deployed** - staged locally, to be bundled with the `signal_insert_log` change (already
+logged above) at the next real deploy, per instruction. The VM was not touched.
+
 ## 7b. Notification freeze
 
 `live.notify_enabled` stays `false` for the ENTIRE shadow-mode run, regardless

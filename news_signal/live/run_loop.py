@@ -26,6 +26,25 @@ def utcnow():
     return pd.Timestamp.now(tz="UTC")
 
 
+CALENDAR_REFRESH_BUFFER_DAYS = 14
+CALENDAR_FETCH_HORIZON_DAYS = 60
+
+
+def _calendar_is_stale(path, buffer_days=CALENDAR_REFRESH_BUFFER_DAYS):
+    """A calendar.csv that merely exists can still be exhausted - it was previously only
+    ever refetched when the file was entirely missing, so it silently ran out past its
+    fixed end date and every live event fell outside all known sessions (dist_from_vwap_pct
+    NaN on every event, since the last completed session was always in the past). Require
+    the file to still cover at least buffer_days of trading days beyond today."""
+    if not path.exists():
+        return True
+    cal = pd.read_csv(path)
+    if cal.empty:
+        return True
+    max_date = pd.to_datetime(cal["date"]).max()
+    return max_date < (utcnow().normalize().tz_localize(None) + pd.Timedelta(days=buffer_days))
+
+
 class RateLimiter:
     """Evenly paces every Finnhub call (news polls and quotes) to at most calls_per_min
     per window_sec, shared across call sites. Enforces a minimum spacing between any two
@@ -62,15 +81,146 @@ def market_is_open(cfg):
         return False
 
 
+CA_LOOKBACK_DAYS = 30  # widened from 7 so a VM outage of up to ~3 weeks can't make us miss an action
+CA_SUPPRESSION_TRADING_DAYS = 60  # covers the longest feature window (vol_ratio_5d_40d)
+
+
+def _ca_registry_path():
+    return raw_bars_dir() / "corporate_actions_handled.json"
+
+
+def _load_ca_registry():
+    import json
+
+    p = _ca_registry_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
+
+
+def _save_ca_registry(registry):
+    import json
+
+    _ca_registry_path().write_text(json.dumps(registry, indent=2))
+
+
+def fetch_corporate_actions(ticker, cfg, lookback_days=CA_LOOKBACK_DAYS):
+    """Returns a list of {"ex_date": "YYYY-MM-DD", "type": "forward_split"/"reverse_split"/
+    "spin_off"} for `ticker` within the last `lookback_days`. Used by BarCache to detect a
+    cached bar file spanning across a corporate action (splits: needs a full re-fetch;
+    spin-offs: adjustment=split cannot correct for these at all, so the ticker gets
+    suppressed instead - see corporate_action_suppressed_until)."""
+    try:
+        end = utcnow().strftime("%Y-%m-%d")
+        start = (utcnow() - pd.Timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        r = requests.get(
+            "https://data.alpaca.markets/v1/corporate-actions",
+            headers=_alpaca_headers(cfg),
+            params={"symbols": ticker, "types": "forward_split,reverse_split,spin_off",
+                    "start": start, "end": end, "limit": 100},
+            timeout=15,
+        )
+        r.raise_for_status()
+        ca = r.json().get("corporate_actions", {})
+        out = []
+        for kind, rows in ca.items():
+            action_type = kind[:-1] if kind.endswith("s") else kind  # "forward_splits" -> "forward_split"
+            for row in rows:
+                if row.get("symbol") == ticker and row.get("ex_date"):
+                    out.append({"ex_date": row["ex_date"], "type": action_type})
+        return out
+    except Exception as e:
+        print(f"[bars] corporate-actions check failed for {ticker}: {redact_secrets(e)}")
+        return []
+
+
+def corporate_action_suppressed_until(ticker, sessions):
+    """Returns the UTC cutoff Timestamp before which `ticker` should be suppressed with
+    suppress_reason='corporate_action' due to a recent spin-off - adjustment=split does not
+    correct for spin-off value adjustments (confirmed on HON's 2026-06-29 spin-off, see
+    EVALUATION_PLAN.md), so a refetch cannot fix it and the safe response is to not score
+    real decisions on this ticker until the affected feature windows (up to
+    CA_SUPPRESSION_TRADING_DAYS trading days) have rolled past the event. Returns None if no
+    unexpired spin-off is on record for this ticker."""
+    registry = _load_ca_registry()
+    spinoffs = [a for a in registry.get(ticker, []) if a["type"] == "spin_off"]
+    if not spinoffs:
+        return None
+    sess_starts = sessions["sess_start"].values.astype("datetime64[ns]")
+    cutoffs = []
+    for a in spinoffs:
+        ex = np.datetime64(a["ex_date"])
+        idx = int(np.searchsorted(sess_starts, ex, side="left"))
+        end_idx = min(idx + CA_SUPPRESSION_TRADING_DAYS, len(sess_starts) - 1)
+        if end_idx < 0:
+            continue
+        cutoffs.append(pd.Timestamp(sess_starts[end_idx]).tz_localize("UTC"))
+    return max(cutoffs) if cutoffs else None
+
+
 class BarCache:
     def __init__(self, sessions):
         self.sessions = sessions
         self.cache = {}
+        self._ca_checked = {}  # ticker -> date.date() last checked, so this runs at most once/day
+
+    def _maybe_handle_corporate_actions(self, ticker, path):
+        """A cached bar file is fetched with adjustment=split and grown by appending new
+        bars, never re-adjusting old ones. Checked at most once per ticker per day.
+        - forward_split / reverse_split: if the cache already spans across the ex_date, the
+          whole cached file is deleted so get() re-fetches it from scratch, consistently
+          adjusted, instead of appending onto stale (differently-adjusted) data.
+        - spin_off: adjustment=split does not correct for spin-offs at all, so a refetch
+          would still contain the fake price drop - see corporate_action_suppressed_until()
+          for the suppression-based handling instead.
+        Each (ticker, ex_date, type) is recorded in a small on-disk registry once handled, so
+        a legitimately-pre-ex_date cache (which is expected and correct after a real refetch)
+        doesn't get deleted again on every check within the lookback window."""
+        today = utcnow().date()
+        if self._ca_checked.get(ticker) == today:
+            return
+        self._ca_checked[ticker] = today
+        from news_signal.config import load_config
+
+        actions = fetch_corporate_actions(ticker, load_config())
+        if not actions:
+            return
+        registry = _load_ca_registry()
+        ticker_handled = registry.setdefault(ticker, [])
+        handled_keys = {(a["ex_date"], a["type"]) for a in ticker_handled}
+        changed = False
+        for action in actions:
+            key = (action["ex_date"], action["type"])
+            if key in handled_keys:
+                continue
+            if action["type"] in ("forward_split", "reverse_split"):
+                if path.exists():
+                    try:
+                        existing = pd.read_csv(path, index_col=0)
+                        existing.index = pd.to_datetime(existing.index, utc=True)
+                    except Exception:
+                        existing = None
+                    if existing is not None and len(existing) and existing.index.min() <= pd.Timestamp(action["ex_date"], tz="UTC"):
+                        print(f"[bars] {ticker}: {action['type']} detected (ex_date={action['ex_date']}), cache spans across it - deleting for full re-fetch")
+                        path.unlink()
+            elif action["type"] == "spin_off":
+                print(f"[bars] {ticker}: spin_off detected (ex_date={action['ex_date']}) - "
+                      f"adjustment=split cannot correct for this; suppressing with "
+                      f"suppress_reason='corporate_action' for {CA_SUPPRESSION_TRADING_DAYS} trading days instead of refetching")
+            ticker_handled.append(action)
+            changed = True
+        if changed:
+            registry[ticker] = ticker_handled
+            _save_ca_registry(registry)
 
     def get(self, ticker, lookback_days):
         path = raw_bars_dir() / f"{ticker}_1min.csv"
         if ticker in self.cache and (utcnow() - self.cache[ticker][1]).total_seconds() < 300:
             return self.cache[ticker][0]
+        self._maybe_handle_corporate_actions(ticker, path)
         if path.exists():
             dfm = pd.read_csv(path, index_col=0)
             dfm.index = pd.to_datetime(dfm.index, utc=True)
@@ -341,6 +491,51 @@ def _record_retrieval_lag(conn, ticker, headline, published_iso, lag_minutes, re
     conn.commit()
 
 
+def _ensure_signal_insert_log_table(conn):
+    """Durable, per-call record of every argument passed to db.insert_signal() - independent
+    of the signals table itself, so a bug that corrupts the insert (e.g. a field silently
+    landing NULL) can be caught with full context at the moment it happens, rather than
+    reconstructed after the fact from an ambiguous signals row."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS signal_insert_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            logged_at_utc TEXT,
+            ts_utc TEXT,
+            ticker TEXT,
+            class_name TEXT,
+            prob_calibrated REAL,
+            prob_raw REAL,
+            severity_score REAL,
+            severe INTEGER,
+            entry_price REAL,
+            entry_source TEXT,
+            stop_price REAL,
+            headline TEXT,
+            url TEXT,
+            status TEXT,
+            suppress_reason TEXT,
+            news_source TEXT,
+            dedup_group_id TEXT,
+            n_symbols INTEGER
+        )"""
+    )
+    conn.commit()
+
+
+def _record_signal_insert(conn, kw, ts_iso):
+    conn.execute(
+        """INSERT INTO signal_insert_log
+           (logged_at_utc,ts_utc,ticker,class_name,prob_calibrated,prob_raw,severity_score,severe,
+            entry_price,entry_source,stop_price,headline,url,status,suppress_reason,news_source,
+            dedup_group_id,n_symbols)
+           VALUES (:logged_at_utc,:ts_utc,:ticker,:class_name,:prob_calibrated,:prob_raw,:severity_score,:severe,
+            :entry_price,:entry_source,:stop_price,:headline,:url,:status,:suppress_reason,:news_source,
+            :dedup_group_id,:n_symbols)""",
+        {**kw, "logged_at_utc": ts_iso},
+    )
+    conn.commit()
+
+
 _sessions_holder = {"sessions": None}
 
 
@@ -435,6 +630,9 @@ def process_items(items, ctx, news_source="finnhub"):
         severe = int((decision["class"] == "Sell" and sev_score <= severe_sell_edge) or (decision["class"] in ("Buy", "Strong Buy") and sev_score >= severe_buy_edge))
         status = decision["status"]
         reason = "" if status == "fired" else ("sell_side_suppressed" if decision["class"] == "Sell" and "Sell" in suppressed else "below_threshold")
+        ca_cutoff = corporate_action_suppressed_until(ev["ticker"], ctx["sessions"])
+        if ca_cutoff is not None and published < ca_cutoff:
+            status, reason = "silent", "corporate_action"
         entry_price, entry_source = fetch_quote(cfg, ev["ticker"])
         if entry_price is None:
             if len(minutes) == 0:
@@ -444,8 +642,7 @@ def process_items(items, ctx, news_source="finnhub"):
         stop_price = entry_price * (1 - cfg["backtest"]["stop_atr_multiple"] * float(X["atr14_1h_pct"].iloc[0])) if decision["class"] in ("Buy", "Strong Buy") else np.nan
         bucket_start = published.floor(f"{dedup_window_min}min")
         dedup_group_id = hashlib.md5(f"{ev['ticker']}|{bucket_start.isoformat()}".encode()).hexdigest()[:12]
-        sid = db.insert_signal(
-            conn,
+        insert_kw = dict(
             ts_utc=published.isoformat(),
             ticker=ev["ticker"],
             class_name=decision["class"],
@@ -464,6 +661,8 @@ def process_items(items, ctx, news_source="finnhub"):
             dedup_group_id=dedup_group_id,
             n_symbols=(int(ev["n_symbols"]) if ev.get("n_symbols") is not None and not pd.isna(ev.get("n_symbols")) else None),
         )
+        _record_signal_insert(conn, insert_kw, utcnow().isoformat())
+        sid = db.insert_signal(conn, **insert_kw)
         line = f"[signal] {ev['ticker']} {decision['class']} p_cal={decision['prob_calibrated']:.3f} sev={sev_score:+.2f} status={status}"
         if status == "fired" and decision["class"] != "Sell":
             fired_count += 1
@@ -482,7 +681,12 @@ def backfill_outcomes(ctx):
     for signal_id, ticker, entry_px, stop_px, ts_iso in pending:
         minutes = bars.get(ticker, cfg.get("live", {}).get("bar_cache_days", 75))
         exit_target = pd.Timestamp(ts_iso) + pd.Timedelta(minutes=horizon_min)
-        res = simulate_exit(minutes, ts_iso, exit_target.isoformat(), float(entry_px), float(stop_px))
+        # stop_price is NULL/None for every non-Buy/Strong-Buy signal (silent Sell/Neutral/
+        # below-threshold) - simulate_exit() already treats a NaN stop as "never stops,
+        # exit at horizon close", exactly the right behavior for a signal that was never
+        # actually entered; float(None) would raise, so convert explicitly.
+        stop_val = float(stop_px) if stop_px is not None else float("nan")
+        res = simulate_exit(minutes, ts_iso, exit_target.isoformat(), float(entry_px), stop_val)
         if res is None:
             continue
         net = (res["exit_price"] * (1 - slip)) / (float(entry_px) * (1 + slip)) - 1.0
@@ -549,11 +753,16 @@ def main():
     _ensure_stale_rejection_table(conn)
     _ensure_retrieval_lag_table(conn)
     _ensure_alpaca_news_table(conn)
-    if not calendar_path().exists():
+    _ensure_signal_insert_log_table(conn)
+    if _calendar_is_stale(calendar_path()):
         from news_signal.ingest.alpaca_bars import fetch_calendar
 
-        print("[setup] calendar.csv missing - fetching trading calendar")
-        fetch_calendar(cfg)
+        print("[setup] calendar.csv missing or stale - refreshing trading calendar")
+        fetch_calendar(
+            cfg,
+            start=cfg["dates"]["bars_start"],
+            end=(utcnow().normalize() + pd.Timedelta(days=CALENDAR_FETCH_HORIZON_DAYS)).strftime("%Y-%m-%d"),
+        )
     sessions = build_sessions(calendar_path())
     _sessions_holder["sessions"] = sessions
     profiles = pull_company_profiles(cfg)

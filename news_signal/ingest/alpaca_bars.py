@@ -16,11 +16,11 @@ def _headers(cfg):
     }
 
 
-def fetch_calendar(cfg):
+def fetch_calendar(cfg, start=None, end=None):
     resp = requests.get(
         CALENDAR_URL,
         headers=_headers(cfg),
-        params={"start": cfg["dates"]["bars_start"], "end": cfg["dates"]["bars_end"]},
+        params={"start": start or cfg["dates"]["bars_start"], "end": end or cfg["dates"]["bars_end"]},
         timeout=30,
     )
     resp.raise_for_status()

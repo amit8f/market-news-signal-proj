@@ -5,7 +5,15 @@ data/raw/
 data/interim/
 data/processed/
 data/live/
+data/external/
 models/
+
+# research/ pipeline outputs (regenerable from research/*.py + data/external/) - same
+# never-tracked convention as data/ above; write-ups belong in outputs/ instead, which stays tracked
+research/*.csv
+research/*.parquet
+research/*.pkl
+research/*.json
 *.log
 *.db
 .venv/

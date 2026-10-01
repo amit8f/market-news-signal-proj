@@ -1070,3 +1070,79 @@ signal logging, so this freeze cannot bias the dataset itself.
 Weekly: scripts/shadow_status.py output appended to outputs/shadow_reviews/,
 including counts vs Section 4 targets, hit-rate Wilson CIs, calibration drift,
 and uptime proxies. The formal Section-5 test runs only at minimum sample.
+
+## 9. Secondary descriptive analyses (registered 2026-10-01, before looking)
+
+**Registered before looking:** written and committed on 2026-10-01 before any
+return, outcome, or class-level statistic from `signals_oct1.db` (VM snapshot
+through 2026-09-30) or any later DB copy was computed or viewed for these
+analyses. Implemented in `scripts/weekly_report.py` (read-only on the DB; no
+live-path code touched). These are SECONDARY/DESCRIPTIVE analyses: they do not
+replace or amend the Section 3 primary endpoint or the Section 5 decision rule,
+they support no promotion/rejection decision, and adding them changes no
+model, threshold, config, or Section 1-7b rule - so, consistent with every
+dated log entry above, this addition does not reset the evaluation clock.
+
+**Sample.** All rows of the DB's `signals` table, minus (counted, never silent):
+- signals with `ts_utc` before 2026-09-09T13:07:29 UTC (the Section 7
+  calendar-bug affected window; class labels there are known-wrong);
+- `suppress_reason='corporate_action'` rows (per the Section 7 BarCache entry);
+- signals with no matching `signal_insert_log` row (no decision time);
+- signals whose decision time is outside a regular session;
+- signals with no usable bars for the stock or SPY in the window.
+Section 4a's per-day validity gates are NOT applied here (this report does
+not compute uptime); that is stated in every report.
+
+**Window and returns.** Decision time t0 = `signal_insert_log.logged_at_utc`
+(matched to its `signals` row on `ts_utc`, `ticker`, `url`, `headline`;
+duplicates paired in insertion order) - the first moment the system could act,
+not the headline's publish time. t1 = min(t0 + 120 min, that session's close).
+Bars: Alpaca 1-min, `feed=sip`, `adjustment=all`, pagination followed,
+zero-volume bars dropped, regular-session bars only. P0 = open of the first
+bar starting at/after t0; P1 = close of the last bar starting before t1.
+Raw return = P1/P0 - 1 (gross, no costs). Market-adjusted return = stock raw
+return minus SPY raw return over the identical [t0, t1).
+
+**Statistic and uncertainty.** Trading day = ET date of t0. Point estimate =
+day-clustered mean (mean over trading days of each day's mean; Section 3
+convention), with the pooled per-signal mean shown alongside. 95% CI = day
+bootstrap, B=2000, percentile, seed 20261001. Every number is printed with
+its n signals and n trading days.
+
+**(a)** Raw and market-adjusted 2h return: all signals; each class (Strong
+Buy, Buy, Neutral, Sell); fired Buy/Strong Buy.
+
+**(b) Random-ticker control.** For each signal, one ticker drawn uniformly
+from the other universe tickers in `config.yaml` (currently 39) that have a
+valid return over the identical [t0, t1); its market-adjusted return replaces
+the signal's. Repeat 1,000 times (seed 20261001), computing the same
+day-clustered mean each time. Report the percentile of the real mean in that
+distribution (share of draw means below it, ties counted half). Groups: all
+signals; fired Buy/Strong Buy. **The fired Buy/Strong Buy percentile is this
+section's headline number** - still descriptive, not a decision test.
+
+**(c) Breakdowns of (a), exploratory.** Groups: all signals; fired Buy/Strong
+Buy. Regime features via `news_signal/features/regime.py`'s own
+`spy_regime_row()` / `ticker_regime_row()` with `config.yaml`'s windows
+(SMA 50/200; vol 5/60 days), from strictly prior-day daily closes (Alpaca
+daily, `feed=sip`, `adjustment=all` - approximates, does not reproduce, the
+live features, which use `feed=iex`/`adjustment=split`). Fixed cuts, chosen
+before looking: `spy_above_sma200` 1 vs 0; `vol_ratio_5d_40d` > 1 vs <= 1
+(short-window realized vol expanding vs contracting); `mom_5d` > 0 vs <= 0;
+missing values reported as their own bucket. Time of day of t0: first hour
+(< open + 60 min), last 2h (>= close - 120 min; windows here are clipped at
+the close, so shorter than 2h), midday (everything else).
+
+**(d) Silent-Sell check, EXPLORATORY ONLY.** Signals with `class_name='Sell'`
+(any status; all are logged, none acted on): day-clustered mean
+market-adjusted 2h return with CI, plus the share of signals with a negative
+market-adjusted return. Descriptive only: creates no short strategy, does not
+lift the Section 1 Sell suppression, and resets no clock.
+
+**Sample-size rules applied when reading these numbers.** Section 4 (>= 40
+valid trading days with a fired long signal AND >= 300 fired Buy/Strong Buy)
+and Section 6 (no per-class claim under 40 active days) apply: below them,
+every result is labelled "too small to conclude". Any cell with < 30 signals
+is additionally flagged as thin. With (a)-(d) producing dozens of cells, some
+will look "significant" by chance; any such cell is a hypothesis for a
+future pre-registered test, never a finding.

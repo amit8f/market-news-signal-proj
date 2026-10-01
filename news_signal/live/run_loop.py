@@ -129,7 +129,9 @@ def fetch_corporate_actions(ticker, cfg, lookback_days=CA_LOOKBACK_DAYS):
         for kind, rows in ca.items():
             action_type = kind[:-1] if kind.endswith("s") else kind  # "forward_splits" -> "forward_split"
             for row in rows:
-                if row.get("symbol") == ticker and row.get("ex_date"):
+                # splits name the ticker in `symbol`; spin-offs have no `symbol` and name the parent in
+                # `source_symbol` (`new_symbol` is the spun-off child, which has no pre-event cache)
+                if ticker in (row.get("symbol"), row.get("source_symbol")) and row.get("ex_date"):
                     out.append({"ex_date": row["ex_date"], "type": action_type})
         return out
     except Exception as e:

@@ -153,11 +153,74 @@ def test_spinoff_suppresses_then_lifts():
         reg_path.unlink()
 
 
+# Verbatim Alpaca /v1/corporate-actions response for symbols=HON, 2026-06-01..2026-07-31 (pulled
+# 2026-10-01). Spin-offs carry the parent ticker in `source_symbol` (no `symbol` field), unlike splits.
+HON_20260629_RESPONSE = {
+    "corporate_actions": {
+        "cash_dividends": [{
+            "cusip": "438516106", "ex_date": "2026-05-15", "foreign": False,
+            "id": "aa65de71-a3fe-4f2f-968e-800ebcf31205", "payable_date": "2026-06-05",
+            "process_date": "2026-06-05", "rate": 1.19, "record_date": "2026-05-15",
+            "special": False, "symbol": "HON",
+        }],
+        "reverse_splits": [{
+            "ex_date": "2026-06-29", "id": "08faf3fd-5e20-43f1-a96d-e858c083cb65",
+            "new_cusip": "438516205", "new_rate": 1, "old_cusip": "438516106", "old_rate": 2,
+            "payable_date": "2026-06-29", "process_date": "2026-06-29", "record_date": "2026-06-29",
+            "symbol": "HON",
+        }],
+        "spin_offs": [{
+            "due_bill_redemption_date": "2026-06-29", "ex_date": "2026-06-29",
+            "id": "87a92cb7-9afb-4814-a146-e3abb46a4fdb", "new_cusip": "43849R105", "new_rate": 0.5,
+            "new_symbol": "HONA", "payable_date": "2026-06-29", "process_date": "2026-06-29",
+            "record_date": "2026-06-15", "source_cusip": "438516106", "source_rate": 1,
+            "source_symbol": "HON",
+        }],
+    },
+    "next_page_token": None,
+}
+
+
+def test_hon_fixture_spinoff_detected_and_suppressed():
+    """Regression for the source_symbol bug: fetch_corporate_actions() used to match only on
+    `symbol`, silently dropping every spin-off. Runs the real parser on the real HON response."""
+    print("\n=== test 4: HON 2026-06-29 Alpaca response -> spin-off detected, 60-day suppression ===")
+    cleanup()
+    sessions = build_sessions(ROOT / "data" / "raw" / "calendar.csv")
+    resp = mock.Mock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = HON_20260629_RESPONSE
+
+    with mock.patch.object(run_loop.requests, "get", return_value=resp):
+        actions = run_loop.fetch_corporate_actions("HON", {"alpaca_key_id": "x", "alpaca_secret_key": "x"})
+    print(f"  parsed actions: {actions}")
+    assert {"ex_date": EX_DATE, "type": "spin_off"} in actions, "spin-off NOT detected (source_symbol ignored)"
+    assert {"ex_date": EX_DATE, "type": "reverse_split"} in actions, "reverse split no longer detected"
+
+    # non-existent cache path, so the reverse-split branch has nothing to delete (never touches the real HON cache)
+    path = raw_bars_dir() / "HON_FIXTURETEST_1min.csv"
+    with mock.patch.object(run_loop, "fetch_corporate_actions", return_value=actions):
+        run_loop.BarCache(sessions)._maybe_handle_corporate_actions("HON", path)
+
+    cutoff = run_loop.corporate_action_suppressed_until("HON", sessions)
+    assert cutoff is not None, "expected the HON spin-off to produce a suppression cutoff"
+    sess_starts = sessions["sess_start"].values.astype("datetime64[ns]")
+    ex_idx = int(np.searchsorted(sess_starts, np.datetime64(EX_DATE), side="left"))
+    expected = pd.Timestamp(sess_starts[ex_idx + run_loop.CA_SUPPRESSION_TRADING_DAYS]).tz_localize("UTC")
+    print(f"  suppression cutoff: {cutoff} (expected {expected})")
+    assert cutoff == expected, "suppression window is not CA_SUPPRESSION_TRADING_DAYS trading days from ex_date"
+    assert pd.Timestamp(sess_starts[ex_idx + 5]).tz_localize("UTC") < cutoff
+    assert not (pd.Timestamp(sess_starts[ex_idx + 61]).tz_localize("UTC") < cutoff)
+    print("  [PASS] HON spin-off detected from the real response and suppressed for 60 trading days")
+    cleanup()
+
+
 if __name__ == "__main__":
     try:
         test_split_triggers_refetch()
         test_split_not_reprocessed_on_second_run()
         test_spinoff_suppresses_then_lifts()
+        test_hon_fixture_spinoff_detected_and_suppressed()
         print("\nALL TESTS PASSED")
     finally:
         cleanup()

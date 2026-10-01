@@ -1054,6 +1054,115 @@ correction to that entry above), and no DB migration was needed. Pre-deploy test
 present (1,200 rows). Backups on the VM: `~/deploy-backups/code-20261001T063926Z.tgz` and
 `~/deploy-backups/signals-20261001T063926Z.db` (integrity ok, 1,673 signals).
 
+**Spin-off detection bug in the `BarCache` corporate-actions fix, 2026-10-01 - Section 7 bug fix,
+implemented and tested locally, NOT deployed, no clock reset:** found during the 2026-10-01
+read-only diagnostics. `fetch_corporate_actions()` (`news_signal/live/run_loop.py`) kept a returned
+action only if `row["symbol"] == ticker`. Per Alpaca's corporate-actions schema, splits carry a
+`symbol` field but spin-offs do not: they name the parent in `source_symbol` and the spun-off child
+in `new_symbol`. Every spin-off was therefore silently dropped, and the spin-off suppression path
+of the entry above (part 2) could never trigger in production. Confirmed on Alpaca's real HON
+response for 2026-06-01..07-31: the old parser returned only the `reverse_split`, not the
+`spin_off` (`source_symbol: "HON"`, `new_symbol: "HONA"`, ex_date 2026-06-29). Test 3 of
+`scripts/test_barcache_split_refetch.py` stubbed `fetch_corporate_actions()` itself, so it never
+exercised the parser and missed this.
+
+Fix: an action is kept if the ticker matches `symbol` OR `source_symbol`. `new_symbol` is
+deliberately not matched: it is the spun-off child, a new listing with no pre-event cache to
+protect. One line changed in `fetch_corporate_actions()`; no model, threshold, or config value
+changed. New test 4 in `scripts/test_barcache_split_refetch.py` feeds the verbatim HON Alpaca
+response through the real parser and `_maybe_handle_corporate_actions()`. It fails on the old code
+("spin-off NOT detected") and passes on the new code: the spin-off is detected, recorded, and
+suppression runs exactly `CA_SUPPRESSION_TRADING_DAYS` (60) trading days from ex_date (cutoff
+2026-09-23 13:30 UTC; active at +5 days, lifted at +61). All 4 tests pass; both changed files parse
+under Python 3.10; the `--inject-demo` smoke test is clean.
+
+Effect on collected data: none. Since the 2026-10-01T06:43:38 UTC deploy, no split or spin-off
+occurred in the 30-day lookback for any of the 40 tickers (Alpaca queried 2026-10-01). HON's
+2026-06-29 event is outside the lookback, and its 60-day window would have ended 2026-09-23 anyway,
+so deploying this fix will not suppress any ticker today. It only makes the next spin-off among the
+40 detectable.
+
+**Descriptive diagnostics, 2026-10-01 - descriptive note only, no decision, no change, no clock
+reset.** Source: `signals_oct1.db` (VM snapshot through 2026-09-30) plus local frozen artifacts. Not
+the Section 3 primary endpoint; not used in any Section 5 decision. Read-only; scratch scripts were
+not committed.
+
+*Latency.* Sample: the 1,200 signals in the Section 9 funnel (from 2026-09-09T13:07:29 UTC, not
+corporate-action, matched to `signal_insert_log`). Publish -> decision: median 29.45 min, p90 54.9.
+The split below uses `seen_news.first_seen_utc` (hash recomputed per signal; 1,200/1,200 matched).
+
+| feed | n | publish -> first seen, median / p90 | first seen -> decision, median / p90 |
+|---|---|---|---|
+| Finnhub | 705 | 43.6 / 56.7 min | 9.7 / 22.7 s |
+| Alpaca (Benzinga) | 495 | 3.7 / 6.2 min | 5.6 / 10.4 s |
+| fired Buy/Strong Buy, Finnhub | 29 | 44.8 / 53.0 min | 8.2 / 17.8 s |
+| fired Buy/Strong Buy, Alpaca | 19 | 4.4 / 6.0 min | 5.7 / 11.3 s |
+
+The 29.5 min median is a blend of two feeds, not processing time. The Finnhub row survives the
+60-min stale gate. Across all 5,548 Finnhub items in `retrieval_lag` since 2026-09-09, the median
+lag is 143.5 min, 12.6% arrive within 60 min, and none within 5 min. Alpaca, all 1,224
+`alpaca_news_seen` rows over the same period: median 3.9 min, p90 6.5. Each poll cycle adds
+~1.4 min of waiting on average (~2.7 min worst): 40 paced Finnhub calls, ~44 s, plus 120 s sleep.
+Articles' original sources are not stored, so no per-source breakdown is possible.
+
+Alpaca news WebSocket check (`wss://stream.data.alpaca.markets/v1beta1/news`, existing keys,
+`news: ["*"]`, local machine only, the VM stays REST-only). Auth and subscribe succeeded, so the
+stream works on our plan. Two 3-min sessions during market hours: 0 items, then 1 item
+(19:14:41-19:17:42 UTC) received 0.5 s after its `created_at`. That item was not yet returned by
+REST ~2.6 min after creation and was by ~3.6 min. n=1, anecdotal.
+
+*Feature-group importance (frozen `champion_xgb_4class.json`).* Severity is not a model input.
+Share of total gain:
+- technical 1-h/intraday 62.7%
+- regime/daily 18.3%
+- news flow (`hours_since_prev_headline`, `headlines_prior_24h`) 5.8%
+- news content (sentiment, `nt_*`, `relevance_tier`) 5.6%
+- time of day 4.4%
+- sector dummies 3.1%
+
+Mean |SHAP| share for the predicted class, 40 offline-replayed fired Buy/Strong Buy signals since
+2026-09-09:
+- technical 47.8%
+- regime 21.1%
+- news flow 11.0%
+- news content 9.8%
+- sector 6.5%
+- time of day 4.0%
+
+On the 24 whose replayed class matched live: 46.3 / 22.2 / 12.9 / 9.6 / 4.6 / 4.4%. The replay is
+approximate: the DB stores no summaries, and bars were refetched from Alpaca (IEX), not taken from
+the VM cache. 3 signals with identical bars reproduced exactly; overall class agreement was 60%.
+31 of 40 replayed rows were `nt_other`.
+
+*Headline content.* 50 random headlines from those 1,200 (pandas `sample`, random_state=7),
+hand-classified:
+- new material company fact: 3 (6%) - NVDA buyback, twice; ORCL Project Jupiter warning
+- new minor company fact: 3 (6%)
+- analyst rating change: 2 (4%)
+- recap / opinion / move-explainer / listicle / market commentary: 42 (84%)
+
+In 5 of the 50, the tagged ticker is not the headline's subject.
+
+*Passing mentions firing.* Replaying the 48 fired Buy/Strong Buy signals from headline text alone,
+8 are tier-3 passing mentions, i.e. tier 1 came only from the (unstored) summary. Examples:
+- signal 649, NVDA Strong Buy: "SolarEdge Stock Is Trending Higher: What's Going On?"
+- signals 1251/1254, NVDA Strong Buy: "What's Going On With Super Micro Computer Stock Thursday?"
+- signal 676, T Buy: "Company News for Sep 11, 2026"
+- signal 775, NVDA Strong Buy: "Vertical Data Secures $192 Million AI Infrastructure Commitment…"
+
+Only one of the 8 (signal 1179, JNJ, a TECVAYLI/DARZALEX data headline) is plausibly about the
+tagged company.
+
+*Flat Buy calibration.* The Buy isotonic map in `calibration.pkl` is nearly flat: raw 0.1 -> 0.240,
+and every raw value from 0.3 to 0.95 maps to 0.261. After the four classes are renormalized,
+whether Buy reaches its 0.29 threshold depends mainly on how small the other classes' calibrated
+mass is, not on the model's Buy confidence. Example (offline, 2026-08-20, WMT): raw Buy 0.869 ->
+calibrated 0.289 -> silent. For comparison, Strong Buy's map spans 0.125-0.449.
+
+*Case study.* MRK and MRNA are not in the universe. The 2026-08-19 melanoma-vaccine news reached
+the system only as tier-1 PFE read-across headlines; offline, both scored raw Sell (0.61, 0.59) and
+stayed silent.
+
 ## 7b. Notification freeze
 
 `live.notify_enabled` stays `false` for the ENTIRE shadow-mode run, regardless

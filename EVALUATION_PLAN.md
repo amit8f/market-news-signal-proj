@@ -607,6 +607,17 @@ full expected field set (`news_source='finnhub'`,
 per instruction, will ship bundled with whatever the next real change to
 `run_loop.py` ends up being, rather than as its own deploy.
 
+**Correction, 2026-10-01 - no clock reset:** the "not yet deployed" status
+above was wrong. `signal_insert_log` has been **live since the
+2026-09-09T13:07:29 UTC deploy**: it was carried along inside `run_loop.py`
+by the calendar-staleness critical-bug-fix deploy (and re-synced again by the
+2026-09-14 deploy). Evidence: VM-pulled `signals_sept10.db` and
+`signals_sept17.db` both contain the table, with the first row at
+`logged_at_utc` 2026-09-09T13:32:35 UTC (25 minutes after that deploy) and
+455 rows by 2026-09-17; the live schema matches the local code exactly. As
+stated above, it is diagnostic-only, so per Section 7's scope this does not
+reset the evaluation clock.
+
 Re-checked for recurrence (2026-09-04): no signal after `signal_id` 279/the
 2026-09-03 17:30:00-18:08:00 window shows a NULL `news_source`. **The
 anomaly appears contained to that one Sept 3rd window - 5 affected signals
@@ -1029,6 +1040,19 @@ Tested locally (`scripts/test_barcache_split_refetch.py`, three cases, all passi
 
 **Not yet deployed** - staged locally, to be bundled with the `signal_insert_log` change (already
 logged above) at the next real deploy, per instruction. The VM was not touched.
+
+**Deployed to the VM at 2026-10-01T06:43:38 UTC** (confirmed via `systemctl show` at restart time -
+`ActiveEnterTimestamp` 2026-10-01T06:43:38 UTC, new PID 371921, `NRestarts=0`). Section 7 data-quality
+fix: **no clock reset**. Service was stopped 06:40:18-06:43:38 UTC (3m20s, market closed, no signals
+missed). Pre-deploy diff of the VM's running code against the bundle showed only `EVALUATION_PLAN.md`,
+`news_signal/live/run_loop.py`, `scripts/check_feature_parity.py` and
+`scripts/test_barcache_split_refetch.py` changed - nothing under `models/` or `config/`. This deploy
+shipped only the corporate-actions fix: `signal_insert_log` was already live since 2026-09-09 (see the
+correction to that entry above), and no DB migration was needed. Pre-deploy tests:
+`scripts/test_barcache_split_refetch.py` 3/3 passing, `--inject-demo` smoke test clean, all shipped
+`.py` files compile under Python 3.10. Post-deploy: live DB `PRAGMA integrity_check` ok, `signal_insert_log`
+present (1,200 rows). Backups on the VM: `~/deploy-backups/code-20261001T063926Z.tgz` and
+`~/deploy-backups/signals-20261001T063926Z.db` (integrity ok, 1,673 signals).
 
 ## 7b. Notification freeze
 

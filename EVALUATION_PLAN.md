@@ -1082,6 +1082,21 @@ occurred in the 30-day lookback for any of the 40 tickers (Alpaca queried 2026-1
 so deploying this fix will not suppress any ticker today. It only makes the next spin-off among the
 40 detectable.
 
+**Deployed to the VM at 2026-10-03T12:17:07 UTC** (`systemctl show`: `ActiveEnterTimestamp`
+2026-10-03T12:17:07 UTC, new PID 396718, `NRestarts=0`). Section 7 bug fix: **no clock reset**.
+Service was stopped 12:12:40-12:17:07 UTC (4m27s, Saturday, market closed, no signals missed).
+Bundle `news-signal-bundle-20261001b.tgz`, SHA-256
+`dfb3fd3f3416fc31fd60532eb007f0aad38b0f829b5701e7bde39dfeaffc6867`. Pre-deploy diff of the VM's running
+code against the bundle showed only `news_signal/live/run_loop.py`, `scripts/weekly_report.py` (new,
+read-only reporting script never run by the service), `scripts/test_barcache_split_refetch.py` and
+`EVALUATION_PLAN.md` changed - nothing under `models/` or `config/`. Only those four files were copied
+in. Pre-deploy tests on the VM's Python 3.10 in a staging directory:
+`scripts/test_barcache_split_refetch.py` 4/4 passing. Post-deploy: deployed `run_loop.py` SHA-256
+`35dbae3e8aaf783c536e642ad8541e441212668fb34f69e0184db4a8ddc8dacf` (matches the bundle); a read-only
+`fetch_corporate_actions('HON', lookback_days=120)` on the VM now returns the 2026-06-29 `spin_off`.
+Backups on the VM: `~/deploy-backups/code-20261003T121214Z.tgz` and
+`~/deploy-backups/signals-20261003T121214Z.db` (integrity ok, 1,854 signals).
+
 **Descriptive diagnostics, 2026-10-01 - descriptive note only, no decision, no change, no clock
 reset.** Source: `signals_oct1.db` (VM snapshot through 2026-09-30) plus local frozen artifacts. Not
 the Section 3 primary endpoint; not used in any Section 5 decision. Read-only; scratch scripts were
